@@ -33,6 +33,10 @@ from utils.download import _resolve_snapshot_path
 from utils.device import set_device
 from utils.prompt_template import get_prompt
 from utils.logger import avg_logger, avg_acc_logger
+
+## [NEW] ##
+from torch.optim.lr_scheduler import CosineAnnealingLR
+## [END NEW] ##
     
 def get_seq_log_prob(prompts, tokenizer, model, device):
     encoded_batch = tokenizer.encode(
@@ -116,11 +120,14 @@ def train_or_test(args, model, tokenizer, batch, optimizer=None, is_training=Tru
         num_characters = torch.tensor([len(prompt) for prompt in prompts], device=device).sum()
         bpd = -seq_log_prob.sum()/num_characters
 
-        if is_training:
-            assert optimizer is not None, "Optimizer must be provided during training."
-            optimizer.zero_grad()
-            bpd.backward()
-            optimizer.step()
+        # if is_training:
+        #     assert optimizer is not None, "Optimizer must be provided during training."
+        #     optimizer.zero_grad()
+        #     bpd.backward()
+        #     optimizer.step()
+        #     ## [NEW] ##
+        #     scheduler.step() 
+        #     ## [END NEW] ##
 
     is_correct, (probs, labels_pred) = bayes_inverse_llm_classifier(args, model, batch, tokenizer, device=device)
 
@@ -223,6 +230,10 @@ if __name__ == "__main__":
         )
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+
+    ## [NEW] ##
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.num_iterations)
+    ## [END NEW] ##
     
     if os.path.exists(args.prob_output_folder) == False:
         os.makedirs(args.prob_output_folder)
@@ -230,6 +241,9 @@ if __name__ == "__main__":
     ## [NEW] ##
     best_val_accuracy = 0.0
     best_model_state = None
+
+    accum_steps = 8            # batch_size 2 * 8 = effective batch size 16
+    optimizer.zero_grad()      # Initialize gradients
     ## [END NEW] ##
     
     for iteration in tqdm(range(args.num_iterations), desc="Training"):
@@ -273,14 +287,28 @@ if __name__ == "__main__":
             break
                     
         batch = next(iter(training_dataloader))
-        
-        bpd, is_correct, _ = train_or_test(
+       
+        bpd, is_correct, _ = train_or_test( # [NEW] commented out in "apply changes each step" train_or_test function
             args = args, 
             model = model, 
             tokenizer = tokenizer, 
             batch = batch, 
             optimizer = optimizer,
             is_training = True)
+
+        ## [NEW] ##
+        # -- APPLY GRADIENT ACCUMULATION --
+        # We divide by accum_steps so the gradients don't explode
+
+        loss = bpd / accum_steps
+        loss.backward()  # Accumulate gradients
+        
+        # [NEW] Only Update every 'accum_steps'
+        if (iteration + 1) % accum_steps == 0:
+            optimizer.step()       # Update weights
+            scheduler.step()       # Update Learning Rate
+            optimizer.zero_grad()  # Reset for next chunk
+        ## [END NEW] ##
         
         wandb.log({
             "training_batch_bpd": bpd.item(),

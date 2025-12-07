@@ -1,9 +1,18 @@
+# PROMPT_TEMPLATE = (
+#     "{user_prompt}\n"
+#     "The following email is labeled as {label}.\n"
+#     "Subject: {subject}\n"
+#     "Message: {message}"
+# )
+
+## [NEW] ##
 PROMPT_TEMPLATE = (
     "{user_prompt}\n"
-    "The following email is labeled as {label}.\n"
+    "Label: {label}\n" # more efficient
     "Subject: {subject}\n"
     "Message: {message}"
 )
+## [END NEW] ##
 
 def get_prompt(subject: str, message: str, label: str, max_seq_length: int = 256, user_prompt: str = "") -> str:
     prompt = PROMPT_TEMPLATE.format(user_prompt=user_prompt, subject=subject, message=message, label=label)
