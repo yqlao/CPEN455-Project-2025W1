@@ -23,6 +23,7 @@ import torch
 from torch.utils.data import DataLoader
 from torch.nn import functional as F
 
+
 from autograder.dataset import CPEN455_2025_W1_Dataset, ENRON_LABEL_INDEX_MAP, prepare_subset
 from model import LlamaModel
 from utils.weight_utils import load_model_weights
@@ -34,6 +35,7 @@ from utils.prompt_template import get_prompt
 from utils.logger import avg_logger, avg_acc_logger
 
 ## [NEW] ##
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import copy # for copy.deepcopy
 ## [END NEW] ##
     
@@ -119,11 +121,14 @@ def train_or_test(args, model, tokenizer, batch, optimizer=None, is_training=Tru
         num_characters = torch.tensor([len(prompt) for prompt in prompts], device=device).sum()
         bpd = -seq_log_prob.sum()/num_characters
 
-        if is_training:
-            assert optimizer is not None, "Optimizer must be provided during training."
-            optimizer.zero_grad()
-            bpd.backward()
-            optimizer.step()
+        # if is_training:
+        #     assert optimizer is not None, "Optimizer must be provided during training."
+        #     optimizer.zero_grad()
+        #     bpd.backward()
+        #     optimizer.step()
+        #     ## [NEW] ##
+        #     scheduler.step() 
+        #     ## [END NEW] ##
 
     is_correct, (probs, labels_pred) = bayes_inverse_llm_classifier(args, model, batch, tokenizer, device=device)
 
@@ -226,14 +231,21 @@ if __name__ == "__main__":
         )
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+
+    ## [NEW] ##
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.num_iterations)
+    ## [END NEW] ##
     
     if os.path.exists(args.prob_output_folder) == False:
         os.makedirs(args.prob_output_folder)
 
     ## [NEW] ##
     best_val_accuracy = 0.0
-    best_model_state = None
     best_val_bpd = float('inf')
+    best_model_state = None
+
+    accum_steps = 8            # batch_size 2 * 8 = effective batch size 16
+    optimizer.zero_grad()      # Initialize gradients
     ## [END NEW] ##
     
     for iteration in tqdm(range(args.num_iterations), desc="Training"):
@@ -270,22 +282,35 @@ if __name__ == "__main__":
                     if val_bpd < best_val_bpd:
                         best_val_bpd = val_bpd
                         best_model_state = copy.deepcopy(model.state_dict()) # Save into memory
-                        # torch.save(best_model_state, "best_model.pt") # Save checkpoint
-                        print(f"🚀 New Best Model found at iter {iteration}! Accuracy: {best_val_bpd:.4f}")
+                        print(f"🚀 New Best Model found at iter {iteration}! BPD: {best_val_bpd:.4f}")
                     ## [END NEW] ##
 
         if not is_required_training(args.method):
             break
                     
         batch = next(iter(training_dataloader))
-        
-        bpd, is_correct, _ = train_or_test(
+       
+        bpd, is_correct, _ = train_or_test( # [NEW] commented out in "apply changes each step" train_or_test function
             args = args, 
             model = model, 
             tokenizer = tokenizer, 
             batch = batch, 
             optimizer = optimizer,
             is_training = True)
+
+        ## [NEW] ##
+        # -- APPLY GRADIENT ACCUMULATION --
+        # We divide by accum_steps so the gradients don't explode
+
+        loss = bpd / accum_steps
+        loss.backward()  # Accumulate gradients
+        
+        # [NEW] Only Update every 'accum_steps'
+        if (iteration + 1) % accum_steps == 0:
+            optimizer.step()       # Update weights
+            scheduler.step()       # Update Learning Rate
+            optimizer.zero_grad()  # Reset for next chunk
+        ## [END NEW] ##
         
         wandb.log({
             "training_batch_bpd": bpd.item(),
@@ -293,18 +318,18 @@ if __name__ == "__main__":
             "training_iteration": iteration,
             })
 
-    ## [NEW] ##
-    if best_model_state is not None:
-        print(f"New Best Model found with bpd: {best_val_bpd}...")
-        model.load_state_dict(best_model_state) # Load the best model state
-    ## [END NEW] ##
-
     # After training, save probabilities on test set
     train_n_val_dataloader = DataLoader(
         train_n_val_dataset, 
         batch_size=args.batch_size, 
         shuffle=False
         )
-        
+
+    ## [NEW] ##
+    if best_model_state is not None:
+        print(f"Loading best model with BPD: {best_val_bpd}...")
+        model.load_state_dict(best_model_state) # Load the best model state
+    ## [END NEW] ##
+
     save_probs(args, model, tokenizer, train_n_val_dataloader, device=device, name = "train_n_val")
     save_probs(args, model, tokenizer, test_dataloader, device=device, name = "test")
