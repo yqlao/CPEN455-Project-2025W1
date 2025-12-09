@@ -124,10 +124,10 @@ def train_or_test(args, model, tokenizer, batch, optimizer=None, is_training=Tru
         #     assert optimizer is not None, "Optimizer must be provided during training."
         #     optimizer.zero_grad()
         #     bpd.backward()
-        #     optimizer.step()
-        #     ## [NEW] ##
-        #     scheduler.step() 
-        #     ## [END NEW] ##
+        #     # ## [NEW] ##
+        #     # optimizer.step()
+        #     # scheduler.step() 
+        #     # ## [END NEW] ##
 
     is_correct, (probs, labels_pred) = bayes_inverse_llm_classifier(args, model, batch, tokenizer, device=device)
 
@@ -210,6 +210,16 @@ if __name__ == "__main__":
     train_n_val_dataset = CPEN455_2025_W1_Dataset(csv_path=args.dataset_path)
     training_dataset, val_dataset = prepare_subset(train_n_val_dataset, int(0.8 * len(train_n_val_dataset)), ratio_spam=0.5, return_remaining=True)
     test_dataset = CPEN455_2025_W1_Dataset(csv_path=args.test_dataset_path)
+    
+    # ## [NEW] ##
+    # # -- Use all training data for training --
+    # training_dataset = train_n_val_dataset 
+
+    # # -- Create a tiny dummy validation set (10 items) --
+    # # We do NOT unpack with "_" because it returns a single object by default
+    # val_dataset = prepare_subset(train_n_val_dataset, 10, ratio_spam=0.5) 
+    # test_dataset = CPEN455_2025_W1_Dataset(csv_path=args.test_dataset_path)
+    # ## [END NEW] ##
 
     training_dataloader = DataLoader(
         training_dataset, 
@@ -229,10 +239,24 @@ if __name__ == "__main__":
         shuffle=False
         )
     
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+    ## [NEW] ##
+    # -- gradient accumulation steps --
+    accum_steps = 8            # batch_size 2 * 8 = effective batch size 16
+    ## [END NEW] ##
+
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+    ## [NEW] ##
+    # -- increase weight decay to make memorizing data harder --
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.1)
+    ## [END NEW] ##
 
     ## [NEW] ##
-    scheduler = CosineAnnealingLR(optimizer, T_max=args.num_iterations)
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.num_iterations//accum_steps)
+    ## [END NEW] ##
+
+    ## [NEW] ##
+    # -- initialize gradients to zero --
+    optimizer.zero_grad()      # Initialize gradients
     ## [END NEW] ##
     
     if os.path.exists(args.prob_output_folder) == False:
@@ -241,14 +265,14 @@ if __name__ == "__main__":
     ## [NEW] ##
     best_val_accuracy = 0.0
     best_model_state = None
+    best_val_bpd = float('inf')
 
-    accum_steps = 8            # batch_size 2 * 8 = effective batch size 16
-    optimizer.zero_grad()      # Initialize gradients
     ## [END NEW] ##
     
     for iteration in tqdm(range(args.num_iterations), desc="Training"):
                     
-        if (iteration + 1) % 10 == 0:
+        # if (iteration + 1) % 10 == 0:
+        if (iteration + 1) % 24 == 0: ## [NEW] modified to 3*accu_steps ##
             val_acc_logger = avg_acc_logger()
             val_bpd_logger = avg_logger()
             
@@ -276,17 +300,33 @@ if __name__ == "__main__":
                         "training_iteration": iteration,
                         })
                     
+                    # ## [NEW] ##
+                    # # -- Save best model based on validation accuracy --
+                    # if val_acc > best_val_accuracy:
+                    #     best_val_accuracy = val_acc
+                    #     best_model_state = model.state_dict() # Save into memory
+                    #     print(f"🚀 New Best Model found at iter {iteration}! Accuracy: {best_val_accuracy:.4f}")
+                    # ## [END NEW] ##
+
                     ## [NEW] ##
-                    if val_acc > best_val_accuracy:
-                        best_val_accuracy = val_acc
+                    # -- Save best model based on validation bpd --
+                    if val_bpd < best_val_bpd:
+                        best_val_bpd = val_bpd
                         best_model_state = model.state_dict() # Save into memory
-                        print(f"🚀 New Best Model found at iter {iteration}! Accuracy: {best_val_accuracy:.4f}")
+                        print(f"🚀 New Best Model found at iter {iteration}! BPD: {best_val_bpd:.4f}")
                     ## [END NEW] ##
 
         if not is_required_training(args.method):
             break
                     
-        batch = next(iter(training_dataloader))
+        # batch = next(iter(training_dataloader))
+        ## [NEW] ##
+        try: 
+            batch = next(iter(training_dataloader))
+        except StopIteration:
+            training_dataloader = DataLoader(training_dataset, batch_size=args.batch_size, shuffle=True)
+            batch = next(iter(training_dataloader))
+        ##
        
         bpd, is_correct, _ = train_or_test( # [NEW] commented out in "apply changes each step" train_or_test function
             args = args, 
@@ -296,15 +336,20 @@ if __name__ == "__main__":
             optimizer = optimizer,
             is_training = True)
 
-        ## [NEW] ##
-        # -- APPLY GRADIENT ACCUMULATION --
-        # We divide by accum_steps so the gradients don't explode
+        #3 [NEW] ##
+        #  -- step the scheduler each iteration --
+        # scheduler.step()  
+        ## [END NEW] ##
+
+        # ## [NEW] ##
+        # # -- APPLY GRADIENT ACCUMULATION --
+        # # We divide by accum_steps so the gradients don't explode
 
         loss = bpd / accum_steps
         loss.backward()  # Accumulate gradients
         
         # [NEW] Only Update every 'accum_steps'
-        if (iteration + 1) % accum_steps == 0:
+        if (iteration + 1) % accum_steps == 0: # update once every accum_steps
             optimizer.step()       # Update weights
             scheduler.step()       # Update Learning Rate
             optimizer.zero_grad()  # Reset for next chunk
@@ -316,6 +361,20 @@ if __name__ == "__main__":
             "training_iteration": iteration,
             })
 
+    # ## [NEW] ##
+    # ## -- Load best model based on validation accuracy --
+    # if best_model_state is not None:
+    #     print(f"Loading best model with accuracy {best_val_accuracy:.4f}...")
+    #     model.load_state_dict(best_model_state) # Load the best model state
+    # ## [END NEW] ##
+
+    ## [NEW] ##
+    ## -- Load best model based on validation bpd --
+    if best_model_state is not None:
+        print(f"Loading best model with accuracy {best_val_bpd:.4f}...")
+        model.load_state_dict(best_model_state) # Load the best model state
+    ## [END NEW] ##
+
     # After training, save probabilities on test set
     train_n_val_dataloader = DataLoader(
         train_n_val_dataset, 
@@ -324,9 +383,3 @@ if __name__ == "__main__":
         )
     save_probs(args, model, tokenizer, train_n_val_dataloader, device=device, name = "train_n_val")
     save_probs(args, model, tokenizer, test_dataloader, device=device, name = "test")
-
-    ## [NEW] ##
-    if best_model_state is not None:
-        print(f"Loading best model with accuracy {best_val_accuracy}...")
-        model.load_state_dict(best_model_state) # Load the best model state
-    ## [END NEW] ##
