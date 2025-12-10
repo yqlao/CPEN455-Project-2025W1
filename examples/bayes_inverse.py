@@ -35,10 +35,11 @@ from utils.prompt_template import get_prompt
 from utils.logger import avg_logger, avg_acc_logger
 
 ## [NEW] ##
+from model.llama import LlamaModel, apply_lora  # Import apply_lora to implement LoRA
 from torch.optim.lr_scheduler import CosineAnnealingLR
-import copy # for copy.deepcopy
+import copy
 ## [END NEW] ##
-    
+
 def get_seq_log_prob(prompts, tokenizer, model, device):
     encoded_batch = tokenizer.encode(
         prompts, return_tensors="pt", return_attention_mask=True
@@ -72,8 +73,12 @@ def bayes_inverse_llm_classifier(args, model, batch, tokenizer, device):
 
     _, subjects, messages, labels = batch
 
-    prompts_ham = [get_prompt(subject=subj, message=msg, label=ENRON_LABEL_INDEX_MAP.inv[0], max_seq_length=args.max_seq_len, user_prompt=args.user_prompt) for subj, msg in zip(subjects, messages)]
-    prompts_spam = [get_prompt(subject=subj, message=msg, label=ENRON_LABEL_INDEX_MAP.inv[1], max_seq_length=args.max_seq_len, user_prompt=args.user_prompt) for subj, msg in zip(subjects, messages)]
+    ## [NEW] ##
+    # prompts_ham = [get_prompt(subject=subj, message=msg, label=ENRON_LABEL_INDEX_MAP.inv[0], max_seq_length=args.max_seq_len, user_prompt=args.user_prompt) for subj, msg in zip(subjects, messages)]
+    # prompts_spam = [get_prompt(subject=subj, message=msg, label=ENRON_LABEL_INDEX_MAP.inv[1], max_seq_length=args.max_seq_len, user_prompt=args.user_prompt) for subj, msg in zip(subjects, messages)]
+    prompts_ham = [get_prompt(subject=subj, message=msg, label="normal email", max_seq_length=args.max_seq_len, user_prompt=args.user_prompt) for subj, msg in zip(subjects, messages)]
+    prompts_spam = [get_prompt(subject=subj, message=msg, label="spam", max_seq_length=args.max_seq_len, user_prompt=args.user_prompt) for subj, msg in zip(subjects, messages)]
+    ## [END NEW] ##
 
     # The first half are ham, the second half are spam
     prompts = prompts_ham + prompts_spam
@@ -114,7 +119,24 @@ def train_or_test(args, model, tokenizer, batch, optimizer=None, is_training=Tru
     else:
         labels_text = [ENRON_LABEL_INDEX_MAP.inv[int(label_index)] for label_index in label_indexs]
 
-        prompts = [get_prompt(subject=subj, message=msg, label=label, max_seq_length=args.max_seq_len) for subj, msg, label in zip(subjects, messages, labels_text)]
+        ## [NEW] ##
+        # prompts = [get_prompt(subject=subj, message=msg, label=label, max_seq_length=args.max_seq_len) for subj, msg, label in zip(subjects, messages, labels_text)]
+        clean_labels = []
+        for l in labels_text:
+            # Check for both "ham" (if using old map) or "normal_email" (if using new map)
+            if l == "ham":
+                clean_labels.append("normal email")
+            elif l == "spam":
+                clean_labels.append("spam")
+            else:
+                clean_labels.append(l)
+
+        # 2. Use 'clean_labels' to generate prompts
+        prompts = [
+            get_prompt(subject=subj, message=msg, label=label, max_seq_length=args.max_seq_len) 
+            for subj, msg, label in zip(subjects, messages, clean_labels) # <--- UPDATED
+        ]
+        ## [END NEW] ##
 
         seq_log_prob = get_seq_log_prob(prompts, tokenizer, model, device=device)
         
@@ -126,9 +148,6 @@ def train_or_test(args, model, tokenizer, batch, optimizer=None, is_training=Tru
         #     optimizer.zero_grad()
         #     bpd.backward()
         #     optimizer.step()
-        #     ## [NEW] ##
-        #     scheduler.step() 
-        #     ## [END NEW] ##
 
     is_correct, (probs, labels_pred) = bayes_inverse_llm_classifier(args, model, batch, tokenizer, device=device)
 
@@ -205,6 +224,11 @@ if __name__ == "__main__":
     # Load model
     model = LlamaModel(config)
     load_model_weights(model, checkpoint, cache_dir=model_cache_dir, device=device)
+
+    ## [NEW] ##
+    # -- Apply LoRA for parameter-efficient fine-tuning --
+    # apply_lora(model, rank=32, alpha=64, target_modules=["q_proj", "v_proj", "k_proj", "o_proj", "gate_proj", "up_proj", "down_proj"])
+    ## [END NEW] ##
     model = model.to(device)
 
     # Set up datasets and dataloaders
@@ -231,32 +255,41 @@ if __name__ == "__main__":
         )
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
+    
+    ## [NEW] ##
+    # -- apply lora
+    # lora_params = [p for p in model.parameters() if p.requires_grad]
+    # optimizer = torch.optim.AdamW(lora_params, lr=3e-4) # LoRA often needs higher LR (e.g., 1e-4 or 3e-4)
+    ## [END NEW] ##
 
     ## [NEW] ##
+    # -- apply scheduler --
     scheduler = CosineAnnealingLR(optimizer, T_max=args.num_iterations)
     ## [END NEW] ##
-    
+
     if os.path.exists(args.prob_output_folder) == False:
         os.makedirs(args.prob_output_folder)
+    if os.path.exists("./examples/ckpt") == False:
+        os.makedirs("./examples/ckpt")
 
     ## [NEW] ##
+    # -- Initialize variables to track the best model based on validation BPD --
     best_val_accuracy = 0.0
-    best_val_bpd = float('inf')
     best_model_state = None
+    best_val_bpd = float('inf')
 
-    accum_steps = 8            # batch_size 2 * 8 = effective batch size 16
+    # -- Gradient accumulation setup --
+    accum_steps = 8            # batch_size 8 * 8 = effective batch size 64
     optimizer.zero_grad()      # Initialize gradients
     ## [END NEW] ##
     
-    for iteration in tqdm(range(args.num_iterations), desc="Training"):
-                    
+    for iteration in tqdm(range(args.num_iterations), desc="Training"): 
         if (iteration + 1) % 10 == 0:
-            val_acc_logger = avg_acc_logger()
-            val_bpd_logger = avg_logger()
-            
             with torch.no_grad():
                 for batch in tqdm(val_dataloader, desc="Evaluating on validation set during training"):
-                    
+                    val_acc_logger = avg_acc_logger()
+                    val_bpd_logger = avg_logger() 
+
                     bpd, is_correct, (probs, labels_pred) = train_or_test(
                         args = args, 
                         model = model, 
@@ -279,9 +312,11 @@ if __name__ == "__main__":
                         })
                     
                     ## [NEW] ##
+                    # -- save best model based on lowest BPD instead of accuracy --
                     if val_bpd < best_val_bpd:
                         best_val_bpd = val_bpd
-                        best_model_state = copy.deepcopy(model.state_dict()) # Save into memory
+                        best_model_state = copy.deepcopy(model.state_dict())
+                        torch.save(model.state_dict(), "./examples/ckpts/best_model.pt") # Save best model state
                         print(f"🚀 New Best Model found at iter {iteration}! BPD: {best_val_bpd:.4f}")
                     ## [END NEW] ##
 
@@ -289,21 +324,21 @@ if __name__ == "__main__":
             break
                     
         batch = next(iter(training_dataloader))
-       
-        bpd, is_correct, _ = train_or_test( # [NEW] commented out in "apply changes each step" train_or_test function
+        
+        bpd, is_correct, _ = train_or_test(
             args = args, 
             model = model, 
             tokenizer = tokenizer, 
             batch = batch, 
             optimizer = optimizer,
             is_training = True)
-
+        
         ## [NEW] ##
         # -- APPLY GRADIENT ACCUMULATION --
         # We divide by accum_steps so the gradients don't explode
-
         loss = bpd / accum_steps
         loss.backward()  # Accumulate gradients
+        ## [END NEW] ##
         
         # [NEW] Only Update every 'accum_steps'
         if (iteration + 1) % accum_steps == 0:
@@ -311,12 +346,19 @@ if __name__ == "__main__":
             scheduler.step()       # Update Learning Rate
             optimizer.zero_grad()  # Reset for next chunk
         ## [END NEW] ##
-        
+
         wandb.log({
             "training_batch_bpd": bpd.item(),
             "training_batch_acc": is_correct.float().mean().item(),
             "training_iteration": iteration,
             })
+
+    ## [NEW] ##
+    if best_model_state is not None:
+        print(f"Best model is found with bpd: {best_val_bpd}...")
+        model.load_state_dict(best_model_state)
+    else:
+        print("No training was performed, using the final model in memory.")
 
     # After training, save probabilities on test set
     train_n_val_dataloader = DataLoader(
@@ -324,12 +366,6 @@ if __name__ == "__main__":
         batch_size=args.batch_size, 
         shuffle=False
         )
-
-    ## [NEW] ##
-    if best_model_state is not None:
-        print(f"Loading best model with BPD: {best_val_bpd}...")
-        model.load_state_dict(best_model_state) # Load the best model state
-    ## [END NEW] ##
 
     save_probs(args, model, tokenizer, train_n_val_dataloader, device=device, name = "train_n_val")
     save_probs(args, model, tokenizer, test_dataloader, device=device, name = "test")
